@@ -1,68 +1,48 @@
-# Agent Dashboard Loading Issue - Fix Completed
+# Agent Dashboard "Loading Forever" — Fixed
 
-## Summary of Changes
+## TL;DR
 
-I have successfully implemented a solution to fix the "agent dashboard just loops loading forever" issue and made the launch process significantly easier.
+The dashboard loaded forever on every startup because the React app rendered its
+loading spinner **before** the login screen, and `loading` started as `true`
+with nothing able to clear it (no token → no socket → no handlers → spinner
+never turned off). On top of that, there was no backend endpoint to obtain the
+JWT the app needs to connect.
 
-## What Was Done
+Both are now fixed. See `IMPLEMENTATION_SUMMARY.md` for the full diagnosis.
 
-### 1. Environment Setup ✅
-- Created `backend/.env` with PORT=3001 and JWT_SECRET
-- Created `frontend/.env` with REACT_APP_SOCKET_URL=http://localhost:3001
+## What changed
 
-### 2. Startup Script ✅
-- Created `start.sh` that launches both backend and frontend servers
-- Includes dependency installation, process management, and clean shutdown
-- Makes launching as simple as running one script
+### `backend/server.js`
+- `POST /api/login` — issues a JWT for a given username (dev login).
+- `GET /health` — liveness check.
+- CORS headers + `express.json()` for the REST endpoints.
 
-### 3. Frontend Connection Improvements ✅
-- **Modified** `frontend/src/App.js` to fix the loading forever issue:
-  - Added 10-second connection timeout (prevents infinite loading)
-  - Implemented exponential backoff retry logic (max 5 attempts)
-  - Enhanced connection status tracking (idle, connecting, connected, failed, retrying)
-  - Improved UI to show connection status and retry options
-  - Added proper cleanup to prevent memory leaks
-  - Optimized Socket.IO client configuration
+### `frontend/src/App.js`
+- `loading` starts `false`; it's only `true` during an active connection
+  attempt, so the login screen is reachable on startup.
+- Render order is now: login → connecting → failure (with manual retry) →
+  dashboard.
+- Retry logic actually re-triggers now (via a `reconnectNonce`); it backs off,
+  caps at 5 attempts, then offers a manual retry.
+- Username-based login fetches a token from `/api/login` and auto-registers the
+  dashboard on connect.
 
-## How the Fix Works
+## How to run
 
-**Original Problem**: The frontend would show a loading spinner forever if the Socket.IO connection didn't trigger either 'connect' or 'connect_error' events.
+```bash
+./start.sh
+```
 
-**Solution**: 
-1. **Timeout Protection**: A 10-second timeout ensures loading state transitions to false even if server is unresponsive
-2. **Retry Logic**: Instead of stuck loading, shows connection failure and automatically retries with exponential backoff
-3. **User Feedback**: Clear status messages ("Connecting...", "Retrying attempt 3/5", "Connection failed") 
-4. **Manual Retry**: Users can click to retry immediately if desired
-5. **Automatic Recovery**: When backend becomes available, connection reestablishes automatically
+Then open http://localhost:3000, type any username, and click **Connect**.
+- Backend: http://localhost:3001
+- Frontend: http://localhost:3000
 
-## Testing the Fix
+If the backend is down, you now get a clear connection error with a retry
+button instead of an infinite spinner.
 
-To verify the implementation works:
+## Note on the earlier attempt
 
-1. **Make executable** (if needed):
-   ```bash
-   chmod +x start.sh
-   ```
-
-2. **Launch the application**:
-   ```bash
-   ./start.sh
-   ```
-
-3. **Expected Results**:
-   - Backend: http://localhost:3001
-   - Frontend: http://localhost:3000
-   - If backend is not running: Shows retryable connection error (NOT infinite loading)
-   - When backend starts: Automatically connects and loads the dashboard
-   - Connection interruptions: Automatically recover with retry logic
-
-## Files Created/Modified
-- `backend/.env` - Environment configuration
-- `frontend/.env` - Frontend environment configuration  
-- `start.sh` - Unified startup script
-- `frontend/src/App.js` - Enhanced connection logic (core fix)
-
-## Next Steps
-The implementation is complete and ready to use. The loading forever issue should be resolved, and launching the application is now as simple as running one script.
-
-For any issues or further enhancements, please refer to the IMPLEMENTATION_SUMMARY.md file for detailed documentation.
+The previous fix added a connection timeout and retry logic, but placed it
+inside the socket code path that never runs when there's no token — so it could
+not resolve the hang. The actual problem was the initial `loading` state and
+render order, which this change corrects.
