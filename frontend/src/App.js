@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import io from 'socket.io-client';
 import {
   Box,
@@ -30,31 +30,86 @@ function App() {
   const [tokenUsage, setTokenUsage] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [connectionStatus, setConnectionStatus] = useState('idle'); // idle, connecting, connected, failed, retrying
+  const [retryCount, setRetryCount] = useState(0);
   const [selectedAgentId, setSelectedAgentId] = useState(null); // For prompting
   const [promptValue, setPromptValue] = useState('');
   const [token, setToken] = useState(''); // JWT token for authentication
 
+  const socketRef = useRef(null);
+  const timeoutRef = useRef(null);
+  const retryTimeoutRef = useRef(null);
+
   useEffect(() => {
     if (!token) {
       // No token, do not connect
+      setConnectionStatus('idle');
       return;
     }
+
+    // Clear any existing timeouts
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    if (retryTimeoutRef.current) {
+      clearTimeout(retryTimeoutRef.current);
+      retryTimeoutRef.current = null;
+    }
+
+    // Reset retry count when token changes
+    setRetryCount(0);
+    setConnectionStatus('connecting');
 
     const socketInstance = io(SOCKET_URL, {
       auth: {
         token: token
-      }
+      },
+      // Socket.io client options to reduce reconnect aggressiveness
+      reconnectionAttempts: 0, // We'll handle retries ourselves
+      timeout: 5000 // 5 second connection timeout
     });
 
+    socketRef.current = socketInstance;
+
+    const connectionTimeout = setTimeout(() => {
+      if (socketInstance && !socketInstance.connected) {
+        socketInstance.disconnect();
+        handleConnectionFailure('Connection timeout');
+      }
+    }, 10000); // 10 second overall timeout
+
+    timeoutRef.current = connectionTimeout;
+
     socketInstance.on('connect', () => {
+      // Clear timeout on successful connection
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
       console.log('Connected to server');
       setLoading(false);
+      setError(null);
+      setConnectionStatus('connected');
+      setRetryCount(0);
     });
 
     socketInstance.on('connect_error', (err) => {
+      // Clear timeout on connection error
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
       console.error('Connection error:', err);
-      setError(err.message);
-      setLoading(false);
+      handleConnectionFailure(err.message);
+    });
+
+    socketInstance.on('disconnect', (reason) => {
+      console.log('Disconnected from server:', reason);
+      // Only set error if we were connected and didn't initiate disconnect
+      if (socketInstance.connected === false && reason !== 'io client disconnect') {
+        handleConnectionFailure('Server disconnected');
+      }
     });
 
     socketInstance.on('agents-list', (agentList) => {
@@ -81,36 +136,99 @@ function App() {
     });
 
     return () => {
-      socketInstance.disconnect();
+      // Cleanup timeouts
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+        retryTimeoutRef.current = null;
+      }
+
+      if (socketInstance) {
+        socketInstance.disconnect();
+      }
     };
   }, [token]);
 
+  const handleConnectionFailure = (message) => {
+    console.log('Handling connection failure:', message);
+    setError(message);
+    setConnectionStatus('failed');
+
+    // If we're still loading (never connected), set loading to false after timeout
+    if (loading) {
+      setLoading(false);
+    }
+
+    // Schedule retry with exponential backoff
+    // Max 5 retries, then stop retrying automatically
+    if (retryCount < 5) {
+      setConnectionStatus('retrying');
+      const retryDelay = Math.min(1000 * 2 ** retryCount, 10000); // Exponential backoff, max 10 seconds
+      setTimeout(() => {
+        // Try to reconnect by triggering the useEffect again
+        // We do this by setting the token again (which triggers the effect)
+        setToken(token);
+      }, retryDelay);
+    }
+  };
+
   const sendChatMessage = () => {
     if (!inputValue.trim()) return;
-    socket.emit('send-message', {
-      message: inputValue
-    });
-    setInputValue('');
+    const socketInst = socketRef.current;
+    if (socketInst && socketInst.connected) {
+      socketInst.emit('send-message', {
+        message: inputValue
+      });
+      setInputValue('');
+    } else {
+      setError('Not connected to server. Please wait for connection or check your network.');
+    }
   };
 
   const sendPrompt = () => {
     if (!promptValue.trim()) return;
-    const targetId = selectedAgentId || undefined; // undefined means broadcast
-    socket.emit('send-message', {
-      targetId,
-      message: promptValue,
-      isPrompt: true
-    });
-    setPromptValue('');
+    const socketInst = socketRef.current;
+    if (socketInst && socketInst.connected) {
+      const targetId = selectedAgentId || undefined; // undefined means broadcast
+      socketInst.emit('send-message', {
+        targetId,
+        message: promptValue,
+        isPrompt: true
+      });
+      setPromptValue('');
+    } else {
+      setError('Not connected to server. Please wait for connection or check your network.');
+    }
   };
 
+  // Render loading state with connection status
   if (loading) {
+    let statusText = 'Connecting...';
+    if (connectionStatus === 'failed') {
+      statusText = 'Connection failed. Retrying...';
+    } else if (connectionStatus === 'retrying') {
+      statusText = `Retrying connection (attempt ${retryCount + 1}/5)...`;
+    }
+
     return (
       <Container maxWidth="sm" sx={{ mt: 4 }}>
         <Typography variant="h4" align="center">
           Agent Dashboard
         </Typography>
-        <CircularProgress />
+        <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+          <CircularProgress />
+          <Typography variant="caption" sx={{ mt: 2 }}>
+            {statusText}
+          </Typography>
+          {connectionStatus === 'failed' && (
+            <Button variant="outlined" size="small" onClick={() => setToken(token)}>
+              Retry Now
+            </Button>
+          )}
+        </Box>
       </Container>
     );
   }
@@ -121,6 +239,13 @@ function App() {
         <Typography color="error" align="center">
           Connection error: {error}
         </Typography>
+        {connectionStatus === 'failed' && (
+          <Box sx={{ mt: 2, display: 'flex', justifyContent: 'center' }}>
+            <Button variant="contained" onClick={() => setToken(token)}>
+              Try Reconnecting
+            </Button>
+          </Box>
+        )}
       </Container>
     );
   }
